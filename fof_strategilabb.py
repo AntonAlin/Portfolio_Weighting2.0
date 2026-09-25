@@ -88,6 +88,33 @@ GROUP_CAPS = {
     "Atlant-familjen": (["0P0001788T.ST", "0P0001788U.ST", "0P000091OL.ST", "0P00017FUN.ST"], 0.40),
 }
 
+# Marknadssyn per tillgångsslag: "bullish", "neutral" eller "bearish".
+# Modellen räknar fram vikterna precis som vanligt och lutar sedan portföljen lite åt ditt håll,
+# via varje fonds korrelation mot tillgångsslaget. Åsikten är kryddan, inte huvudrätten.
+MARKET_VIEWS = {
+    "ACWI":  "neutral",   # Globala aktier
+    "^OMX":  "neutral",   # Svenska aktier
+    "IEF":   "neutral",   # Statsobligationer, bullish = du tror på fallande räntor
+    "HYG":   "neutral",   # High yield-kredit
+    "GLD":   "neutral",   # Guld
+    "DBC":   "neutral",   # Råvaror
+    "SEK=X": "neutral",   # USD/SEK, bullish = starkare dollar och svagare krona
+}
+VIEW_LEVELS = {"bearish": -1.0, "neutral": 0.0, "bullish": 1.0}
+VIEW_STRENGTH = 0.20            # hur hårt en åsikt drar i en fond med korrelation 1 mot tillgångsslaget
+MAX_VIEW_TILT = 0.25            # en fonds vikt kan som mest skalas upp eller ned 25 %
+MAX_VIEW_SHIFT = 0.05           # och flyttas högst 5 procentenheter, annars tar FRN hela festen
+APPLY_VIEWS_IN_BACKTEST = False # dagens magkänsla hör inte hemma i 2021 års beslut
+# Om korrelationen ljuger om vad en fond är kan du säga det rakt ut. Raden ersätter då fondens
+# skattade exponering helt, tillgångsslag du inte nämner räknas som 0.
+FUND_VIEW_EXPOSURE = {
+    # "0P0001SODO.ST": {"DBC": 1.0},  # Centaur är en råvarufond, vad tre års brusiga veckodata än tycker
+}
+
+_bad_views = {p: v for p, v in MARKET_VIEWS.items() if p not in PROXIES or v not in VIEW_LEVELS}
+if _bad_views:
+    raise ValueError(f"Ogiltig marknadssyn: {_bad_views}. Nycklar ska finnas i PROXIES och värden i {list(VIEW_LEVELS)}.")
+
 # All-weather-optimeringens straffvikter
 LAMBDA_RC = 1.0
 LAMBDA_CORR = 2.0
@@ -121,7 +148,7 @@ STRATEGIES = [
     "Invers vol (rå)",
     "Lika vikt",
 ]
-DEFAULT_STRATEGY = "All-weather FoF"
+DEFAULT_STRATEGY = "HRP"
 BENCHMARK_NAME = "ACWI (SEK)"
 
 FUND_PALETTE = ["#3E7CB1", "#B8323E", "#4F7A5A", "#C8963E", "#6B5B95", "#2A9D8F",
@@ -298,6 +325,7 @@ def estimate_inputs(fr, pr):
     reg_mat = np.array([fr[m].mean().values * PPY for m in masks.values()]) if masks else np.zeros((0, n))
     return {
         "tickers": list(fr.columns),
+        "proxies": list(pr.columns),
         "S": S,
         "S_sample": joint[:n, :n],
         "sigma": np.sqrt(np.diag(S)),
@@ -481,6 +509,41 @@ def compute_all_weights(inp, n_starts, mom):
     return pd.DataFrame(out, index=t)[STRATEGIES]
 
 
+def view_exposures(inp):
+    """Fondernas korrelation mot varje tillgångsslag, med dina manuella överstyrningar ovanpå."""
+    sd_f = np.sqrt(np.diag(inp["S_sample"]))
+    rho = inp["C_fp"] / np.outer(sd_f, inp["sig_p"])
+    E = pd.DataFrame(np.nan_to_num(rho), index=inp["tickers"], columns=inp["proxies"])
+    for tk, row in FUND_VIEW_EXPOSURE.items():
+        if tk not in E.index:
+            continue
+        E.loc[tk] = 0.0
+        for px, x in row.items():
+            if px in E.columns:
+                E.loc[tk, px] = x
+    return E
+
+
+def apply_market_views(W, inp):
+    """Lutar varje strategis vikter mot marknadssynen. Marginellt med flit: modellen har statistiken, du har magkänslan."""
+    E = view_exposures(inp)
+    v = pd.Series({p: VIEW_LEVELS[MARKET_VIEWS.get(p, "neutral")] for p in E.columns})
+    score = E @ v
+    if not v.any():
+        return W.copy(), score  # allt neutralt, ingen anledning att röra något
+    tilt = np.clip(np.exp(VIEW_STRENGTH * score.values), 1 - MAX_VIEW_TILT, 1 + MAX_VIEW_TILT)
+    out = W.copy()
+    for s in W.columns:
+        w = W[s].values
+        target = w * tilt
+        delta = target / target.sum() - w
+        biggest = np.abs(delta).max()
+        if biggest > MAX_VIEW_SHIFT:
+            delta *= MAX_VIEW_SHIFT / biggest  # hela lutningen krymps lika mycket, så summan är fortfarande exakt 1
+        out[s] = w + delta
+    return out, score
+
+
 def weights_at(i, ret_raw, prox, n_starts):
     """Vikter för beslut i vecka i, baserat enbart på data t.o.m. vecka i-1. Ingen tidsresa tillåten."""
     lo_i = max(0, i - BT_LOOKBACK_WEEKS)
@@ -499,7 +562,7 @@ def weights_at(i, ret_raw, prox, n_starts):
     inp = estimate_inputs(block[eligible], block[list(est_p.columns)])
     mwin = ret_raw.iloc[max(0, i - SIGNAL_WEEKS):i][eligible].fillna(0.0)
     mom = ((1 + mwin).prod() - 1).values
-    return compute_all_weights(inp, n_starts, mom), block
+    return compute_all_weights(inp, n_starts, mom), block, inp
 
 
 # ---------------------------------------------------------------------
@@ -518,7 +581,9 @@ def walk_forward(ret_raw, prox):
     for k, i in enumerate(rebal):
         j = rebal[k + 1] if k + 1 < len(rebal) else len(dates)
         res = weights_at(i, ret_raw, prox, N_STARTS_BT)
-        Wq = res[0] if res is not None else None
+        Wq = None
+        if res is not None:
+            Wq = apply_market_views(res[0], res[2])[0] if APPLY_VIEWS_IN_BACKTEST else res[0]
         for s in STRATEGIES:
             if Wq is not None:
                 w_new = pd.Series(Wq[s].values, index=Wq.index)
@@ -638,16 +703,30 @@ for s in STRATEGIES:
         "series": {nm(t): mat[t].tolist() for t in mat.columns},
     }
 
-today_weights, corr_payload = {}, {"labels": [], "z": []}
+active_views = {p: v for p, v in MARKET_VIEWS.items() if v != "neutral"}
+view_text = ", ".join(f"{nm(p)} {v}" for p, v in active_views.items()) or "neutral överallt"
+
+today_weights, today_neutral, corr_payload = {}, {}, {"labels": [], "z": []}
 if today is not None:
-    W_today, block_today = today
+    W_neutral, block_today, inp_today = today
+    W_today, view_score = apply_market_views(W_neutral, inp_today)
     for s in STRATEGIES:
         today_weights[s] = {nm(t): float(W_today.loc[t, s]) for t in W_today.index}
+        today_neutral[s] = {nm(t): float(W_neutral.loc[t, s]) for t in W_neutral.index}
     c = block_today.corr()
     corr_payload = {"labels": [nm(x) for x in c.columns], "z": c.values.tolist()}
-    print("\n=== VIKTER OM DU VIKTAR OM IDAG (%) ===")
+    print(f"\n=== VIKTER OM DU VIKTAR OM IDAG (%), MARKNADSSYN: {view_text} ===")
     display((W_today.rename(index=nm) * 100).round(1))
+    if active_views:
+        print(f"\n=== MARKNADSSYNENS EFFEKT PÅ {DEFAULT_STRATEGY} ===")
+        display(pd.DataFrame({
+            "Synpoäng": view_score,
+            "Neutral (%)": W_neutral[DEFAULT_STRATEGY] * 100,
+            "Med syn (%)": W_today[DEFAULT_STRATEGY] * 100,
+            "Skillnad (pe)": (W_today[DEFAULT_STRATEGY] - W_neutral[DEFAULT_STRATEGY]) * 100,
+        }).rename(index=nm).sort_values("Neutral (%)", ascending=False).round(2))
     W_today.rename(index=nm).to_csv("/content/fof_vikter_idag.csv", encoding="utf-8-sig")
+    W_neutral.rename(index=nm).to_csv("/content/fof_vikter_idag_neutral.csv", encoding="utf-8-sig")
 
 dq_cols = ["Fond", "Valuta", "Första datum", "Veckor", "Vol rå", "Vol justerad", "AR(1)", "Nollveckor", "Flagga"]
 dq_rows = dq[dq_cols].reset_index(drop=True).to_dict(orient="records")
@@ -684,6 +763,7 @@ payload = clean({
         f"{TC_BPS} bps per omsatt krona",
         f"{BT_LOOKBACK_WEEKS} veckors estimeringsfönster",
         f"{len(fund_order)} fonder, allt i SEK",
+        f"Marknadssyn: {view_text}" + ("" if APPLY_VIEWS_IN_BACKTEST or not active_views else " (bara dagens vikter)"),
     ],
     "dates": [d.strftime("%Y-%m-%d") for d in filled.index],
     "strategies": STRATEGIES,
@@ -699,6 +779,8 @@ payload = clean({
     "regimes": {"labels": reg_names, "values": reg_vals},
     "weights_hist": wh_payload,
     "today_weights": today_weights,
+    "today_weights_neutral": today_neutral,
+    "views": [{"asset": nm(p), "view": v} for p, v in MARKET_VIEWS.items()],
     "today_date": fund_ret_raw.index[-1].strftime("%Y-%m-%d"),
     "corr": corr_payload,
     "dq": {"cols": dq_cols, "rows": dq_rows},
@@ -797,6 +879,7 @@ DASH_BODY = r"""
         <div class="panel s6"><h3>Rullande 12 månader</h3><p class="note">Avkastning de senaste 52 veckorna.</p><div id="c-roll" class="ch"></div></div>
         <div class="panel s8"><h3>Avkastning per kvartal</h3><p class="note">Ett kvartal motsvarar en omviktningsperiod.</p><div id="c-q" class="ch"></div></div>
         <div class="panel s4"><h3>Vikter vid omviktning idag</h3><p class="note" id="fof-today-note"></p><div id="c-donut" class="ch"></div></div>
+        <div class="panel s12"><h3>Marknadssynens påverkan idag</h3><p class="note" id="fof-view-note"></p><div id="c-views" class="ch"></div></div>
         <div class="panel s12"><h3>Målvikter över tid</h3><p class="note">Vikterna som sattes vid varje kvartalsomviktning. Nya fonder dyker upp när de fått tillräckligt med historik.</p><div id="c-wh" class="ch tall"></div></div>
         <div class="panel s6"><h3>Kalenderår</h3><div id="c-cal" class="ch tall"></div></div>
         <div class="panel s6"><h3>Marknadsregimer</h3><p class="note">Annualiserad medelavkastning de veckor regimen gällde.</p><div id="c-reg" class="ch tall"></div></div>
@@ -935,13 +1018,29 @@ function drawQ(){
 function drawDonut(){
   const w = D.today_weights[S.active] || {};
   const e = Object.entries(w).filter(x => x[1] > 0.0005).sort((a,b) => b[1] - a[1]);
-  $('fof-today-note').textContent = e.length ? 'Beräknat på data till och med ' + D.today_date + '.' : 'Inte tillräckligt med data för en omviktning idag.';
+  const tilted = D.views.some(v => v.view !== 'neutral');
+  $('fof-today-note').textContent = e.length ? 'Beräknat på data till och med ' + D.today_date + (tilted ? ', inklusive din marknadssyn.' : '.') : 'Inte tillräckligt med data för en omviktning idag.';
   Plotly.react('c-donut', [{type:'pie', hole:0.6, sort:false, direction:'clockwise',
     labels:e.map(x => x[0]), values:e.map(x => x[1]),
     marker:{colors:e.map(x => D.fund_colors[x[0]]), line:{color:'#FFFFFF', width:2}},
     textinfo:'percent', textposition:'inside', insidetextfont:{color:'#FFFFFF', size:11},
     hovertemplate:'%{label}<br>%{value:.1%}<extra></extra>'}],
     L({showlegend:true, legend:{orientation:'h', y:-0.05, font:{size:10}}, margin:{l:0, r:0, t:0, b:0}}), CFG);
+}
+
+function drawViews(){
+  const on = D.views.filter(v => v.view !== 'neutral');
+  const w = D.today_weights[S.active] || {}, n = D.today_weights_neutral[S.active] || {};
+  const f = Object.keys(n).filter(k => (n[k] || 0) > 0.0005 || (w[k] || 0) > 0.0005).sort((a,b) => (n[b] || 0) - (n[a] || 0));
+  $('fof-view-note').textContent = on.length
+    ? 'Din syn: ' + on.map(v => v.asset + ' ' + v.view).join(', ') + '. Staplarna visar hur många procentenheter varje fond flyttas jämfört med modellens neutrala vikt.'
+    : 'Alla tillgångsslag står på neutral, så vikterna är modellens egna. Ändra MARKET_VIEWS i koden för att luta portföljen.';
+  const d = f.map(k => (w[k] || 0) - (n[k] || 0));
+  Plotly.react('c-views', [{type:'bar', x:f, y:d, marker:{color:d.map(x => x >= 0 ? C.moss : C.lingon)},
+    customdata:f.map(k => [n[k] || 0, w[k] || 0]),
+    hovertemplate:'%{x}<br>Neutral %{customdata[0]:.1%}, med syn %{customdata[1]:.1%}<br>Skillnad %{y:+.1%}<extra></extra>'}],
+    L({bargap:0.35, margin:{l:56, r:16, t:6, b:90}, xaxis:{type:'category', tickangle:-30, tickfont:{size:10}, gridcolor:'rgba(0,0,0,0)'},
+      yaxis:{tickformat:'+.1%', zeroline:true, zerolinecolor:C.slate}}), CFG);
 }
 
 function drawWH(){
@@ -1032,7 +1131,7 @@ function drawDQ(){
 }
 
 function renderAll(){
-  drawRail(); drawKPIs(); drawWealth(); drawDD(); drawRoll(); drawQ(); drawDonut(); drawWH();
+  drawRail(); drawKPIs(); drawWealth(); drawDD(); drawRoll(); drawQ(); drawDonut(); drawViews(); drawWH();
   heat('c-cal', D.calendar.labels, D.calendar.values);
   heat('c-reg', D.regimes.labels, D.regimes.values);
   drawScatter(); drawTable();
