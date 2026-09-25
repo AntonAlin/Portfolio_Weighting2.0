@@ -44,11 +44,15 @@ FUNDS = {
     "0P0001TF4H.ST": "REQ Nordic Compounders",
     "0P00017FUN.ST": "Atlant Green Tech Metals",
     "0P0000Z75N.F":  "Amundi Volatility World (EUR H)",
+    "0P0001ECQR.ST": "Avanza Global",
+    "0P0001H4TL.ST": "Avanza Emerging Markets",
+    "JEPG.L":        "JPM Global Equity Premium Income (USD dist)",
 }
 
 # Om yfinance har fel om valutan, tvinga fram rätt här.
 CURRENCY_OVERRIDE = {
     # "0P0000AAYU.F": "EUR",
+    "JEPG.L": "USD",  # London-noterad men handlas i dollar. Utan detta kan yfinance få för sig att det är pence
 }
 
 # Proxies för tillgångsklasser i lokal valuta. Valutarisken får en egen proxy (USD/SEK).
@@ -125,7 +129,8 @@ DEFAULT_STRATEGY = "All-weather FoF"
 BENCHMARK_NAME = "ACWI (SEK)"
 
 FUND_PALETTE = ["#3E7CB1", "#B8323E", "#4F7A5A", "#C8963E", "#6B5B95", "#2A9D8F",
-                "#8D6E63", "#5B6B78", "#D46A8C", "#1F4E79", "#9AAF5A", "#E07A3F"]
+                "#8D6E63", "#5B6B78", "#D46A8C", "#1F4E79", "#9AAF5A", "#E07A3F",
+                "#7A4E2D", "#4B8BBE"]
 
 DASHBOARD_PATH = "/content/fof_dashboard.html"
 DOWNLOAD_HTML = False  # True = Colab laddar ned HTML-filen automatiskt när den är klar
