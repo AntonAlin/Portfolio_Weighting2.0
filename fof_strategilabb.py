@@ -44,8 +44,6 @@ FUNDS = {
     "0P0001TF4H.ST": "REQ Nordic Compounders",
     "0P00017FUN.ST": "Atlant Green Tech Metals",
     "0P0000Z75N.F":  "Amundi Volatility World (EUR H)",
-    "0P0001ECQR.ST": "Avanza Global",
-    "0P0001H4TL.ST": "Avanza Emerging Markets",
     "JEPG.L":        "JPM Global Equity Premium Income (USD dist)",
 }
 
@@ -95,8 +93,6 @@ ASSET_CLASS = {
     "0P0001TF4H.ST": "Aktier",
     "0P00017FUN.ST": "Reala tillgångar",
     "0P0000Z75N.F":  "Krisskydd",
-    "0P0001ECQR.ST": "Aktier",
-    "0P0001H4TL.ST": "Aktier",
     "JEPG.L":        "Aktier",
 }
 _unclassified = [n for t, n in FUNDS.items() if t not in ASSET_CLASS]
@@ -120,7 +116,16 @@ TC_BPS = 10
 SEED = 42
 
 STRATEGIES = ["HRP", "HRP + ML"]
-DEFAULT_STRATEGY = "HRP"
+DEFAULT_STRATEGY = "HRP + ML"   # ML-varianten är den vi kör, vanliga HRP står kvar som kontrollgrupp
+
+# Innehavslistan
+INVESTED_CAPITAL = 100_000      # kronor att fördela, byt till ditt eget belopp
+# Nuvarande innehav i kronor per ticker, om du vill ha en färdig köp/sälj-lista. Tomt = nyinvestering.
+# Fonder du äger men som inte längre är med i universumet hamnar som "Utgår" och säljs.
+CURRENT_HOLDINGS = {
+    # "0P0001H70O.ST": 25_000,
+    # "0P0001ECQR.ST": 5_000,    # en fond som inte längre är med i universumet och ska säljas
+}
 BENCHMARK_NAME = "ACWI (SEK)"
 
 FUND_PALETTE = ["#3E7CB1", "#B8323E", "#4F7A5A", "#C8963E", "#6B5B95", "#2A9D8F",
@@ -402,14 +407,20 @@ def ml_class_scores(panel, feats, i):
     return pred, pd.Series(model.feature_importances_, index=feats)
 
 
+def class_multipliers(pred, classes):
+    """Hur mycket skogen vill skala varje tillgångsslags budget. 1,0 = ingen åsikt, eller ingen aning."""
+    classes = sorted(classes)
+    p = pred[pred.index.isin(classes)]
+    if len(p) < 2 or p.std() == 0:
+        return pd.Series(1.0, index=classes)
+    z = (p - p.mean()) / p.std()
+    return np.clip(np.exp(ML_STRENGTH * z), 1 - ML_MAX_TILT, 1 + ML_MAX_TILT).reindex(classes, fill_value=1.0)
+
+
 def ml_tilt(w, tickers, pred):
     """HRP:s vikter, med budgeten per tillgångsslag skalad efter skogens rangordning. Inom slaget rör vi inget."""
     cls = np.array([fund_class(t) for t in tickers])
-    p = pred[pred.index.isin(cls)]
-    if len(p) < 2 or p.std() == 0:
-        return w.copy()
-    z = (p - p.mean()) / p.std()
-    mult = np.clip(np.exp(ML_STRENGTH * z), 1 - ML_MAX_TILT, 1 + ML_MAX_TILT)
+    mult = class_multipliers(pred, set(cls))
     out = w * np.array([mult.get(c, 1.0) for c in cls])
     return out / out.sum()
 
@@ -613,6 +624,171 @@ if today is not None:
         display(imp.rename(index=lambda k: FEATURE_LABELS.get(k, k)).round(3).to_frame("Vikt"))
     W_today.rename(index=nm).to_csv("/content/fof_vikter_idag.csv", encoding="utf-8-sig")
 
+# ---------------------------------------------------------------------
+# 5b. INNEHAVSLISTA
+# ---------------------------------------------------------------------
+def alloc_sek(w, capital):
+    """Hela kronor per fond som summerar exakt till kapitalet. Största resten vinner, som i riksdagsvalet."""
+    raw = w * capital
+    base = np.floor(raw)
+    left = int(round(capital - base.sum()))
+    order = np.argsort(-(raw - base).values)
+    base.iloc[order[:left]] += 1
+    return base
+
+
+def fund_perf(t):
+    """Historik per fond i SEK. Bakåtspegeln, men den enda spegel som inte ljuger om vad som redan hänt."""
+    px = fund_px_w[t].dropna()
+    r = px.pct_change().dropna()
+    back = lambda n: px.iloc[-1] / px.iloc[-1 - n] - 1 if len(px) > n else np.nan
+    prev_year = px[px.index.year < px.index[-1].year]
+    w3 = px.iloc[-BT_LOOKBACK_WEEKS - 1:]
+    ann3 = (w3.iloc[-1] / w3.iloc[0]) ** (PPY / (len(w3) - 1)) - 1 if len(w3) > PPY else np.nan
+    vol3 = r.iloc[-BT_LOOKBACK_WEEKS:].std() * np.sqrt(PPY)
+    return {
+        "r3m": back(13),
+        "rytd": px.iloc[-1] / prev_year.iloc[-1] - 1 if len(prev_year) else np.nan,
+        "r1y": back(52),
+        "r3y": ann3,
+        "mdd3y": (w3 / w3.cummax() - 1).min(),
+        "sharpe3y": (ann3 - RF_ANNUAL) / vol3 if vol3 > 0 and pd.notna(ann3) else np.nan,
+        "hist_weeks": len(r),
+    }
+
+
+def build_holdings(s, W, block, ml):
+    tick = list(W.index)
+    w = W[s]
+    wv = w.values
+    # Samma krympta kovarians som HRP såg, så riskbidragen handlar om exakt den portfölj du köper
+    S = LedoitWolf().fit(block[tick].values).covariance_ * PPY
+    pv = float(np.sqrt(wv @ S @ wv))
+    sd = np.sqrt(np.diag(S))
+    rc = pd.Series(wv * (S @ wv) / pv ** 2, index=tick)
+    corr_p = pd.Series((S @ wv) / (sd * pv), index=tick)
+    vol = pd.Series(sd, index=tick)
+    if "ACWI" in block.columns:
+        eq = block["ACWI"]
+        corr_eq = block[tick].corrwith(eq)
+        beta = float(w @ (block[tick].apply(lambda x: x.cov(eq)) / eq.var()))
+    else:
+        corr_eq, beta = pd.Series(np.nan, index=tick), np.nan
+
+    prev_date = max(whist[s]) if whist[s] else None
+    prev = whist[s][prev_date] if prev_date is not None else pd.Series(dtype=float)
+    cur = pd.Series(CURRENT_HOLDINGS, dtype=float)
+    universe = list(dict.fromkeys(tick + list(cur.index)))
+    w_all = w.reindex(universe, fill_value=0.0)
+    amount = alloc_sek(w_all, INVESTED_CAPITAL)
+    w_hrp = W["HRP"].reindex(universe, fill_value=0.0)
+    use_ml = s == "HRP + ML" and ml is not None
+    mult = class_multipliers(ml[0], {fund_class(t) for t in tick}) if use_ml else pd.Series(dtype=float)
+
+    rows = []
+    for t in universe:
+        held = t in tick
+        was = float(prev.get(t, 0.0)) if prev_date is not None else np.nan
+        rows.append({
+            "ticker": t, "name": nm(t), "cls": fund_class(t),
+            "ccy": dq["Valuta"].get(t, "") if t in dq.index else "",
+            "w": float(w_all[t]), "amount": float(amount[t]),
+            "prev_w": was, "chg_pp": float(w_all[t]) - was if prev_date is not None else np.nan,
+            "ml_pp": float(w_all[t] - w_hrp[t]) if use_ml else np.nan,
+            "rc": float(rc[t]) if held else np.nan,
+            "vol": float(vol[t]) if held else np.nan,
+            "corr_p": float(corr_p[t]) if held else np.nan,
+            "corr_eq": float(corr_eq[t]) if held else np.nan,
+            **(fund_perf(t) if t in fund_px_w.columns else {}),
+            "cur": float(cur.get(t, 0.0)),
+            "trade": float(amount[t] - cur.get(t, 0.0)),
+            "status": "Utgår" if not held else ("Ny" if prev_date is not None and was == 0 else ""),
+        })
+
+    classes = []
+    for c in sorted({r["cls"] for r in rows}, key=lambda c: -sum(r["w"] for r in rows if r["cls"] == c)):
+        members = [r for r in rows if r["cls"] == c]
+        classes.append({
+            "cls": c,
+            "w": sum(r["w"] for r in members),
+            "amount": sum(r["amount"] for r in members),
+            "rc": sum(r["rc"] for r in members if pd.notna(r["rc"])),
+            "w_hrp": float(sum(w_hrp[r["ticker"]] for r in members)),
+            "mult": float(mult.get(c, 1.0)) if use_ml else None,
+        })
+
+    union = prev.index.union(pd.Index(universe))
+    turnover = float((w_all.reindex(union, fill_value=0.0) - prev.reindex(union, fill_value=0.0)).abs().sum() / 2) \
+        if prev_date is not None else np.nan
+    top = w.idxmax()
+    summary = {
+        "capital": INVESTED_CAPITAL,
+        "n": len(tick),
+        "vol": pv,
+        "var1y": 1.645 * pv * INVESTED_CAPITAL,
+        "var1m": 1.645 * pv * np.sqrt(1 / 12) * INVESTED_CAPITAL,
+        "eff_n": 1 / float(np.sum(wv ** 2)),
+        "div": float(wv @ sd) / pv,
+        "beta": beta,
+        "turnover": turnover,
+        "turnover_sek": turnover * INVESTED_CAPITAL if pd.notna(turnover) else np.nan,
+        "prev_date": prev_date.strftime("%Y-%m-%d") if prev_date is not None else None,
+        "top": nm(top),
+        "top_w": float(w[top]),
+        "trade_buy": float(sum(max(r["trade"], 0) for r in rows)),
+        "trade_sell": float(sum(min(r["trade"], 0) for r in rows)),
+    }
+    return {"rows": rows, "classes": classes, "summary": summary, "ml": use_ml, "has_current": bool(CURRENT_HOLDINGS)}
+
+
+HOLD_COLS = [
+    ("cls", "Tillgångsslag", None), ("name", "Fond", None), ("ticker", "Ticker", None), ("ccy", "Valuta", None),
+    ("w", "Vikt (%)", 100), ("amount", "Belopp (SEK)", 1), ("chg_pp", "Förändring mot förra (pe)", 100),
+    ("ml_pp", "ML-justering (pe)", 100), ("rc", "Riskbidrag (%)", 100), ("vol", "Volatilitet (%)", 100),
+    ("corr_p", "Korr. portfölj", 1), ("corr_eq", "Korr. globala aktier", 1), ("r3m", "3 mån (%)", 100),
+    ("rytd", "I år (%)", 100), ("r1y", "1 år (%)", 100), ("r3y", "3 år, per år (%)", 100),
+    ("mdd3y", "Max DD 3 år (%)", 100), ("sharpe3y", "Sharpe 3 år", 1), ("status", "Status", None),
+]
+
+
+def holdings_frame(H):
+    cols = HOLD_COLS + ([("cur", "Nuvarande (SEK)", 1), ("trade", "Köp(+)/Sälj(-) (SEK)", 1)] if H["has_current"] else [])
+    rows = sorted(H["rows"], key=lambda r: (-next(c["w"] for c in H["classes"] if c["cls"] == r["cls"]), -r["w"]))
+    df = pd.DataFrame([{lab: (r.get(k) * f if f and pd.notna(r.get(k, np.nan)) else r.get(k, np.nan) if f else r.get(k, ""))
+                        for k, lab, f in cols} for r in rows])
+    if not H["ml"]:
+        df = df.drop(columns=["ML-justering (pe)"])
+    total = {"Tillgångsslag": "TOTALT", "Fond": f"{H['summary']['n']} fonder",
+             "Vikt (%)": df["Vikt (%)"].sum(), "Belopp (SEK)": df["Belopp (SEK)"].sum(), "Riskbidrag (%)": df["Riskbidrag (%)"].sum()}
+    return pd.concat([df, pd.DataFrame([total])], ignore_index=True)
+
+
+holdings = {}
+if today is not None:
+    for s in STRATEGIES:
+        holdings[s] = build_holdings(s, W_today, block_today, ml_today)
+    H = holdings[DEFAULT_STRATEGY]
+    hs = H["summary"]
+    hold_df = holdings_frame(H)
+    kr = lambda v: f"{v:,.0f}".replace(",", " ") + " kr"  # svenska tusentalsavgränsare, för vi är inte barbarer
+    print(f"\n=== INNEHAVSLISTA, {DEFAULT_STRATEGY.upper()}, {kr(INVESTED_CAPITAL)} ===")
+    print(f"  Förväntad volatilitet {hs['vol']:.1%} | VaR 95 % ett år ≈ {kr(hs['var1y'])} | "
+          f"effektivt antal fonder {hs['eff_n']:.1f} | diversifieringskvot {hs['div']:.2f} | beta mot aktier {hs['beta']:.2f}")
+    try:
+        fmt = {c: "{:,.1f}" for c in hold_df.columns if "(%)" in c or "(pe)" in c}
+        fmt.update({c: "{:,.0f}" for c in hold_df.columns if "(SEK)" in c})
+        fmt.update({c: "{:.2f}" for c in ["Korr. portfölj", "Korr. globala aktier", "Sharpe 3 år"]})
+        display(hold_df.style.format(fmt, na_rep="").bar(subset=["Vikt (%)"], color="#9CC0E0")
+                .bar(subset=["Riskbidrag (%)"], color="#E6A3A9").hide(axis="index"))
+    except Exception:
+        display(hold_df)  # ingen jinja2, ingen styling. Siffrorna är lika rätt i gråskala
+    hold_df.to_csv("/content/fof_innehav.csv", index=False, sep=";", decimal=",", encoding="utf-8-sig")
+    try:
+        hold_df.to_excel("/content/fof_innehav.xlsx", index=False, sheet_name="Innehav")
+        print("Innehavslistan sparad som /content/fof_innehav.csv och /content/fof_innehav.xlsx")
+    except Exception:
+        print("Innehavslistan sparad som /content/fof_innehav.csv (Excel-exporten krävde openpyxl)")
+
 dq_cols = ["Fond", "Valuta", "Första datum", "Veckor", "Vol rå", "Vol justerad", "AR(1)", "Nollveckor", "Flagga"]
 dq_rows = dq[dq_cols].reset_index(drop=True).to_dict(orient="records")
 
@@ -641,7 +817,7 @@ def clean(o):
 
 n_quarters = len(rebal_dates) if (rebal_dates := sorted({d for s in whist for d in whist[s]})) else 0
 payload = clean({
-    "title": "Mid risk, fond i fond",
+    "title": "Låg risk, fond i fond",
     "facts": [
         f"Walk-forward {first_d.strftime('%Y-%m')} till {last_d.strftime('%Y-%m')}",
         f"{n_quarters} kvartalsvisa omviktningar",
@@ -667,6 +843,7 @@ payload = clean({
     "today_date": fund_ret_raw.index[-1].strftime("%Y-%m-%d"),
     "corr": corr_payload,
     "ml": ml_payload,
+    "holdings": holdings,
     "dq": {"cols": dq_cols, "rows": dq_rows},
     "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
 })
@@ -738,6 +915,36 @@ DASH_BODY = r"""
   .fof .top{flex-direction:column;align-items:flex-start}
   .fof .facts{text-align:left}
 }
+.fof .hold-head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin:4px 0 14px}
+.fof .hold-head .cap{font-size:36px;font-weight:800;letter-spacing:-0.025em;line-height:1}
+.fof .hold-head .cap small{display:block;font-size:13px;font-weight:500;color:var(--slate);letter-spacing:0;margin-top:8px}
+.fof .btn{font:inherit;font-size:13px;font-weight:600;border:1px solid var(--ink);background:var(--paper);color:var(--ink);border-radius:8px;padding:8px 14px;cursor:pointer}
+.fof .btn:hover{background:var(--ink);color:var(--paper)}
+.fof .btn:focus-visible{outline:2px solid var(--glacier);outline-offset:2px}
+.fof .hsum{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));border:1px solid var(--rule);border-radius:10px;margin-bottom:16px}
+.fof .hsum > div{padding:12px 14px;border-right:1px solid var(--rule)}
+.fof .hsum > div:last-child{border-right:0}
+.fof .hsum b{display:block;font-size:21px;font-weight:700;letter-spacing:-0.01em;line-height:1.15}
+.fof .hsum span{display:block;font-size:12px;color:var(--slate);margin-top:3px}
+.fof table.hold th{cursor:default;font-size:12px}
+.fof table.hold tbody tr{cursor:default}
+.fof table.hold tr.grp td{background:#F3F6F8;font-weight:700;border-bottom:1px solid var(--rule);padding-top:10px}
+.fof table.hold tr.grp td small{font-weight:500;color:var(--slate);margin-left:8px}
+.fof table.hold tr.tot td{font-weight:800;border-top:2px solid var(--ink);border-bottom:0}
+.fof table.hold td.fund{white-space:normal;min-width:230px}
+.fof table.hold td.fund small{display:block;color:var(--slate);font-size:11px;font-weight:400}
+.fof table.hold td.big{font-weight:700;font-size:14px}
+.fof .wbar{display:flex;align-items:center;gap:8px;justify-content:flex-end}
+.fof .wbar i{display:block;height:8px;border-radius:4px;background:var(--glacier)}
+.fof .wbar.risk i{background:var(--lingon)}
+.fof .tag{display:inline-block;font-size:10px;font-weight:700;padding:1px 7px;border-radius:10px;margin-left:6px;vertical-align:1px;background:var(--moss);color:#fff}
+.fof .tag.out{background:var(--lingon)}
+.fof .mlchip{display:inline-block;font-size:11px;font-weight:700;padding:1px 8px;border-radius:10px;margin-left:8px;border:1px solid currentColor}
+@media (max-width:1100px){
+  .fof .hsum{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .fof .hsum > div:nth-child(2n){border-right:0}
+  .fof .hsum > div{border-bottom:1px solid var(--rule)}
+}
 @media (prefers-reduced-motion:reduce){.fof *{transition:none!important}}
 </style>
 
@@ -754,6 +961,10 @@ DASH_BODY = r"""
     <main>
       <section class="kpis" id="fof-kpis"></section>
       <div class="grid">
+        <div class="panel hero s12" id="fof-hold-panel">
+          <h3>Innehavslista</h3>
+          <div id="fof-hold"></div>
+        </div>
         <div class="panel hero s12">
           <h3>Tillväxt av 1 krona</h3>
           <p class="note">Logaritmisk skala, efter transaktionskostnader. Vald strategi i rött, jämförelseindex streckat, övriga i grått.</p>
@@ -926,6 +1137,95 @@ function drawML(){
     L({margin:{l:150, r:12, t:6, b:30}, xaxis:{tickformat:'.0%'}, yaxis:{type:'category', tickfont:{size:10}}}), CFG);
 }
 
+function sek(v){ return ok(v) ? Math.round(v).toLocaleString('sv-SE') + ' kr' : ''; }
+function spct(v){ return ok(v) ? (v >= 0 ? '+' : '−') + Math.abs(v*100).toFixed(1) + '%' : ''; }
+function pp(v){ return ok(v) ? (Math.abs(v) < 0.0005 ? '0,0' : (v > 0 ? '+' : '−') + Math.abs(v*100).toFixed(1)) + ' pe' : ''; }
+function sgn(v){ return ok(v) && Math.abs(v) >= 0.0005 ? (v > 0 ? 'up' : 'dn') : ''; }
+function bar(v, max, cls){ return ok(v) ? '<div class="wbar ' + (cls || '') + '"><span>' + pct(v,1) + '</span><i style="width:' + Math.max(2, 64 * v / max).toFixed(0) + 'px"></i></div>' : ''; }
+
+function drawHoldings(){
+  const H = (D.holdings || {})[S.active];
+  if (!H) { $('fof-hold').innerHTML = '<p class="note">Inte tillräckligt med data för en innehavslista idag.</p>'; return; }
+  const m = H.summary;
+  const maxW = Math.max.apply(null, H.rows.map(r => r.w || 0));
+  const maxR = Math.max.apply(null, H.rows.map(r => r.rc || 0));
+  const head = '<div class="hold-head"><div class="cap">' + sek(m.capital) +
+    '<small>' + S.active + ', ' + m.n + ' fonder, beräknat på data till och med ' + D.today_date +
+    (m.prev_date ? '. Jämförs med omviktningen ' + m.prev_date : '') + '.</small></div>' +
+    '<button class="btn" id="fof-csv" type="button">Ladda ned innehavslistan (CSV)</button></div>';
+  const tiles = [
+    [pct(m.vol,1), 'Förväntad volatilitet per år'],
+    [sek(m.var1y), 'VaR 95 %, ett år (' + sek(m.var1m) + ' på en månad)'],
+    [num(m.eff_n,1) + ' av ' + m.n, 'Effektivt antal fonder'],
+    [num(m.div,2) + '×', 'Diversifieringskvot'],
+    [num(m.beta,2), 'Beta mot globala aktier'],
+    H.has_current ? [sek(m.trade_buy) + ' / ' + sek(-m.trade_sell), 'Att köpa / att sälja']
+                  : [ok(m.turnover) ? pct(m.turnover,1) : 'saknas', 'Omsättning mot förra omviktningen' + (ok(m.turnover_sek) ? ', ' + sek(m.turnover_sek) : '')]
+  ].map(t => '<div><b>' + t[0] + '</b><span>' + t[1] + '</span></div>').join('');
+
+  const cols = [
+    ['Fond', r => '<td class="fund"><b>' + r.name + '</b>' + (r.status ? '<span class="tag' + (r.status === 'Utgår' ? ' out' : '') + '">' + r.status + '</span>' : '') +
+      '<small>' + r.ticker + (r.ccy ? ' · ' + r.ccy : '') + (r.hist_weeks ? ' · ' + r.hist_weeks + ' veckors historik' : '') + '</small></td>'],
+    ['Vikt', r => '<td class="big">' + bar(r.w, maxW) + '</td>'],
+    ['Belopp', r => '<td class="big">' + sek(r.amount) + '</td>'],
+    ['Förändring', r => '<td class="' + sgn(r.chg_pp) + '">' + pp(r.chg_pp) + '</td>'],
+  ];
+  if (H.ml) cols.push(['ML-justering', r => '<td class="' + sgn(r.ml_pp) + '">' + pp(r.ml_pp) + '</td>']);
+  cols.push(
+    ['Riskbidrag', r => '<td>' + bar(r.rc, maxR, 'risk') + '</td>'],
+    ['Volatilitet', r => '<td>' + (ok(r.vol) ? pct(r.vol,1) : '') + '</td>'],
+    ['Korr. portfölj', r => '<td>' + (ok(r.corr_p) ? num(r.corr_p) : '') + '</td>'],
+    ['Korr. aktier', r => '<td>' + (ok(r.corr_eq) ? num(r.corr_eq) : '') + '</td>'],
+    ['3 mån', r => '<td class="' + sgn(r.r3m) + '">' + spct(r.r3m) + '</td>'],
+    ['I år', r => '<td class="' + sgn(r.rytd) + '">' + spct(r.rytd) + '</td>'],
+    ['1 år', r => '<td class="' + sgn(r.r1y) + '">' + spct(r.r1y) + '</td>'],
+    ['3 år, per år', r => '<td class="' + sgn(r.r3y) + '">' + spct(r.r3y) + '</td>'],
+    ['Max DD 3 år', r => '<td class="dn">' + spct(r.mdd3y) + '</td>'],
+    ['Sharpe 3 år', r => '<td>' + (ok(r.sharpe3y) ? num(r.sharpe3y) : '') + '</td>']
+  );
+  if (H.has_current) cols.push(
+    ['Nuvarande', r => '<td>' + sek(r.cur) + '</td>'],
+    ['Köp / sälj', r => '<td class="big ' + sgn(r.trade / m.capital) + '">' + (Math.abs(r.trade) < 1 ? '' : (r.trade > 0 ? 'Köp ' : 'Sälj ') + sek(Math.abs(r.trade))) + '</td>']
+  );
+
+  let body = '';
+  H.classes.forEach(c => {
+    const chip = (H.ml && c.mult !== null && c.w > 0) ? '<span class="mlchip ' + (c.mult > 1.005 ? 'up' : c.mult < 0.995 ? 'dn' : '') + '">ML ' +
+      (c.mult > 1.005 ? 'övervikt' : c.mult < 0.995 ? 'undervikt' : 'neutral') + ' ×' + num(c.mult,2) + '</span>' : '';
+    const rest = cols.length - 3;
+    body += '<tr class="grp"><td>' + c.cls + chip + '<small>HRP utan ML: ' + pct(c.w_hrp,1) + '</small></td><td>' + pct(c.w,1) + '</td><td>' + sek(c.amount) +
+      '</td><td colspan="' + rest + '" style="text-align:left;color:' + C.slate + ';font-weight:500">Riskbidrag ' + pct(c.rc,1) + '</td></tr>';
+    H.rows.filter(r => r.cls === c.cls).sort((a,b) => b.w - a.w).forEach(r => {
+      body += '<tr>' + cols.map(col => col[1](r)).join('') + '</tr>';
+    });
+  });
+  const totW = H.rows.reduce((a,r) => a + r.w, 0), totA = H.rows.reduce((a,r) => a + r.amount, 0);
+  body += '<tr class="tot"><td>Totalt</td><td>' + pct(totW,1) + '</td><td>' + sek(totA) + '</td><td colspan="' + (cols.length - 3) + '"></td></tr>';
+
+  $('fof-hold').innerHTML = head + '<div class="hsum">' + tiles + '</div>' +
+    '<div class="tw"><table class="hold"><thead><tr>' + cols.map(c => '<th>' + c[0] + '</th>').join('') + '</tr></thead><tbody>' + body + '</tbody></table></div>' +
+    '<p class="note" style="margin-top:10px">Förändring = procentenheter mot förra kvartalets målvikt. ML-justering = hur mycket skogen flyttat fonden jämfört med ren HRP. ' +
+    'Riskbidrag = fondens andel av portföljens totala risk, så en fond kan ha liten vikt men stort riskbidrag. VaR är parametrisk och antar normalfördelning, verkligheten har tjockare svansar. ' +
+    'Belopp avrundas till hela kronor och summerar exakt till kapitalet.</p>';
+  $('fof-csv').onclick = () => downloadCSV(H);
+}
+
+function downloadCSV(H){
+  const n = v => ok(v) ? String(Math.round(v * 10000) / 10000).replace('.', ',') : '';
+  const head = ['Tillgångsslag','Fond','Ticker','Valuta','Vikt (%)','Belopp (SEK)','Förändring (pe)','ML-justering (pe)','Riskbidrag (%)',
+    'Volatilitet (%)','Korr. portfölj','Korr. aktier','3 mån (%)','I år (%)','1 år (%)','3 år per år (%)','Max DD 3 år (%)','Sharpe 3 år','Status']
+    .concat(H.has_current ? ['Nuvarande (SEK)','Köp/sälj (SEK)'] : []);
+  const rows = H.classes.flatMap(c => H.rows.filter(r => r.cls === c.cls).sort((a,b) => b.w - a.w)).map(r => [
+    r.cls, r.name, r.ticker, r.ccy, n(r.w*100), n(r.amount), n(r.chg_pp*100), n(r.ml_pp*100), n(r.rc*100), n(r.vol*100),
+    n(r.corr_p), n(r.corr_eq), n(r.r3m*100), n(r.rytd*100), n(r.r1y*100), n(r.r3y*100), n(r.mdd3y*100), n(r.sharpe3y), r.status
+  ].concat(H.has_current ? [n(r.cur), n(r.trade)] : []));
+  const csv = '\ufeff' + [head].concat(rows).map(r => r.map(x => '"' + String(x).replace(/"/g, '""') + '"').join(';')).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], {type:'text/csv;charset=utf-8'}));
+  a.download = 'innehav_' + S.active.replace(/[^A-Za-z0-9]+/g, '_') + '_' + D.today_date + '.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
 function drawWH(){
   const h = D.weights_hist[S.active];
   if (!h) { Plotly.purge('c-wh'); return; }
@@ -1014,7 +1314,7 @@ function drawDQ(){
 }
 
 function renderAll(){
-  drawRail(); drawKPIs(); drawWealth(); drawDD(); drawRoll(); drawQ(); drawDonut(); drawML(); drawWH();
+  drawRail(); drawKPIs(); drawHoldings(); drawWealth(); drawDD(); drawRoll(); drawQ(); drawDonut(); drawML(); drawWH();
   heat('c-cal', D.calendar.labels, D.calendar.values);
   heat('c-reg', D.regimes.labels, D.regimes.values);
   drawScatter(); drawTable();
@@ -1040,7 +1340,7 @@ body = DASH_BODY.replace("__DATA__", data_json)
 full_html = (
     "<!doctype html><html lang='sv'><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-    "<title>Mid risk, fond i fond</title></head>"
+    "<title>Låg risk, fond i fond</title></head>"
     "<body style='margin:0;padding:16px;background:#E3E9EC'>" + body + "</body></html>"
 )
 with open(DASHBOARD_PATH, "w", encoding="utf-8") as f:
