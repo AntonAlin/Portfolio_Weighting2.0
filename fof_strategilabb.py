@@ -252,7 +252,8 @@ proxy_ret = pd.DataFrame({p: to_weekly(s) for p, s in proxy_px.items()}).ffill(l
 # och backtesten jämför fonder från 2023 med aktiemarknaden 2015. Det blir tomt, av goda skäl.
 proxy_ret = proxy_ret.reindex(fund_ret_raw.index)
 
-# Avutjämnat används bara för estimering. P&L räknas på riktiga priser, för det är de du får betalt i.
+# Helperiodens avutjämning används BARA i datakvalitetstabellen. Backtesten räknar om rho per fönster
+# i weights_at(), annars vet 2019 års optimerare hur trög fonden kommer vara 2025. Det kallas fusk.
 fund_ret_est = pd.DataFrame(index=fund_ret_raw.index)
 rhos = {}
 for t in fund_ret_raw.columns:
@@ -480,11 +481,14 @@ def compute_all_weights(inp, n_starts, mom):
     return pd.DataFrame(out, index=t)[STRATEGIES]
 
 
-def weights_at(i, ret_raw, ret_est, prox, n_starts):
+def weights_at(i, ret_raw, prox, n_starts):
     """Vikter för beslut i vecka i, baserat enbart på data t.o.m. vecka i-1. Ingen tidsresa tillåten."""
     lo_i = max(0, i - BT_LOOKBACK_WEEKS)
-    est_f = ret_est.iloc[lo_i:i]
-    est_p = prox.reindex(ret_est.index).iloc[lo_i:i]  # hängslen och livrem: samma datum oavsett vad som skickas in
+    raw_f = ret_raw.iloc[lo_i:i]
+    # Avutjämning med rho skattad på samma fönster. Nu är tidsresan på riktigt förbjuden, inte bara i docstringen.
+    # Avutjämnat används bara för estimering. P&L räknas på riktiga priser, för det är de du får betalt i.
+    est_f = pd.DataFrame({c: desmooth(raw_f[c])[0] for c in raw_f.columns}, index=raw_f.index)
+    est_p = prox.reindex(ret_raw.index).iloc[lo_i:i]  # hängslen och livrem: samma datum oavsett vad som skickas in
     eligible = [c for c in est_f.columns
                 if est_f[c].notna().sum() >= BT_MIN_WEEKS and pd.notna(ret_raw[c].iloc[i - 1])]
     if len(eligible) < 2:
@@ -502,7 +506,7 @@ def weights_at(i, ret_raw, ret_est, prox, n_starts):
 # 4. WALK-FORWARD MED KVARTALSVIS OMVIKTNING
 #    Omviktning sker första veckan i varje nytt kalenderkvartal.
 # ---------------------------------------------------------------------
-def walk_forward(ret_raw, ret_est, prox):
+def walk_forward(ret_raw, prox):
     dates = ret_raw.index
     q = dates.to_period("Q")
     rebal = [i for i in range(max(BT_MIN_WEEKS, 1), len(dates)) if q[i] != q[i - 1]]
@@ -513,7 +517,7 @@ def walk_forward(ret_raw, ret_est, prox):
     print(f"Kör {len(rebal)} kvartal ...")
     for k, i in enumerate(rebal):
         j = rebal[k + 1] if k + 1 < len(rebal) else len(dates)
-        res = weights_at(i, ret_raw, ret_est, prox, N_STARTS_BT)
+        res = weights_at(i, ret_raw, prox, N_STARTS_BT)
         Wq = res[0] if res is not None else None
         for s in STRATEGIES:
             if Wq is not None:
@@ -542,7 +546,7 @@ def walk_forward(ret_raw, ret_est, prox):
     return pd.DataFrame(port).dropna(how="all"), whist, pd.DataFrame(log)
 
 
-bt_ret, whist, bt_log = walk_forward(fund_ret_raw, fund_ret_est, proxy_ret)
+bt_ret, whist, bt_log = walk_forward(fund_ret_raw, proxy_ret)
 if bt_ret.empty:
     raise RuntimeError("Ingen backtest möjlig: för lite överlappande historik. Sänk BT_MIN_WEEKS eller ta bort den yngsta fonden.")
 
@@ -551,7 +555,7 @@ if acwi_sek is not None:
 SERIES = STRATEGIES + ([BENCHMARK_NAME] if BENCHMARK_NAME in bt_ret else [])
 
 print("\nBeräknar vikter för en omviktning idag ...")
-today = weights_at(len(fund_ret_raw.index), fund_ret_raw, fund_ret_est, proxy_ret, N_STARTS_TODAY)
+today = weights_at(len(fund_ret_raw.index), fund_ret_raw, proxy_ret, N_STARTS_TODAY)
 
 
 # ---------------------------------------------------------------------
